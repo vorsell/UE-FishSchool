@@ -1,0 +1,18 @@
+# Source showcase file allowlist.
+*
+!/.gitignore
+!/README.md
+!/LICENSE
+!/docs/
+!/docs/Architecture.md
+!/docs/OptimizationHistory.md
+!/Source/
+!/Source/UEFishSchool/
+!/Source/UEFishSchool/Private/
+!/Source/UEFishSchool/Private/FishSchool/
+!/Source/UEFishSchool/Private/FishSchool/FishSchoolManagerICO.cpp
+!/Source/UEFishSchool/Public/
+!/Source/UEFishSchool/Public/FishSchool/
+!/Source/UEFishSchool/Public/FishSchool/FishSchoolManagerICO.h
+!/Source/UEFishSchool/Public/Stats/
+!/Source/UEFishSchool/Public/Stats/FishSchoolStats.h
