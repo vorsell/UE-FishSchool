@@ -1,48 +1,31 @@
 # UE-FishSchool
 
-面向十万量级实时鱼群的 Unreal Engine C++ 项目，围绕局部邻域查询、并行行为更新和实例渲染提交进行优化。
+面向十万量级实时鱼群的 Unreal Engine C++ 项目。一个 Manager 维护整群鱼的数据，使用 CPU 并行更新行为，再通过 Instanced Static Mesh（ISM）批量提交实例变换。
 
-本仓库展示当前 CPU 仿真与 ISM 渲染的核心实现。未包含完整 UE 工程、关卡、蓝图及第三方模型、材质和 VAT 资源，不能直接运行。
+这是源码展示仓库。完整 UE 工程、测试关卡、蓝图、第三方模型、材质和 VAT 资源均未包含，仓库不能直接运行。
 
-## 技术要点
+## 核心实现
 
-| 方向 | 实现 |
+| 模块 | 实现 |
 | --- | --- |
-| 数据组织 | 鱼以数组索引表示，位置、朝向等属性分别存储；位置与朝向使用双缓冲 |
-| 邻域查询 | 均匀网格内搜索自身及相邻共 27 格，维护局部 KNN；分组轮换刷新邻居缓存 |
-| 并行更新 | ParallelFor 分段计算；通过任务私有计数、前缀和及 Scatter 构建连续网格索引 |
-| 行为分级 | CPU 粗可见性分类与距离档位；组合 KNN、简化环绕和目标点回归行为 |
-| 实例渲染 | 单 ISM 全量提交与 Chunk ISM 分级提交；完整场景通过资源侧 VAT 和模型 LOD 表现动画及几何层级 |
+| 网格 | 均匀网格。各任务独立计数，经前缀和计算写入区间，再将鱼 ID 并行写入连续数组 |
+| 仿真 | 位置、朝向分别存储并使用双缓冲。内部格做 27 格局部 KNN，按鱼 ID 分组轮换刷新邻居缓存 |
+| 可见性 | CPU 将 Cell 投影到屏幕深度桶，结合距离档位选择 KNN、简化环绕及渲染策略 |
+| 玩家交互 | 玩家进入近距离档位后，在局部通道内调整鱼的游动方向 |
+| 渲染 | 单 ISM 全量批量提交，以及空间 Chunk ISM 分级提交。VAT 动画与模型 LOD 依赖项目资源 |
 
-鱼由一个 Manager 集中更新，每条鱼不单独创建 Actor。当前代码同时保留单 ISM 和 Chunk ISM 两条渲染路径。
+## 阅读源码
 
-## 阅读代码
+从 [Manager 的启动和逐帧更新](Source/UEFishSchool/Private/FishSchool/SimulationV2/FishSchoolManagerV2.cpp)读起。各模块的接口位于 [Public/FishSchool/SimulationV2](Source/UEFishSchool/Public/FishSchool/SimulationV2)，实现在 [Private/FishSchool/SimulationV2](Source/UEFishSchool/Private/FishSchool/SimulationV2)。
 
-~~~text
-Source/UEFishSchool/
-├── Public/
-│   ├── FishSchool/FishSchoolManagerICO.h
-│   └── Stats/FishSchoolStats.h
-└── Private/
-    └── FishSchool/FishSchoolManagerICO.cpp
-~~~
-
-- [FishSchoolManagerICO.h](Source/UEFishSchool/Public/FishSchool/FishSchoolManagerICO.h)：核心数据结构、参数和 Manager 接口。
-- [FishSchoolManagerICO.cpp](Source/UEFishSchool/Private/FishSchool/FishSchoolManagerICO.cpp)：从 HandleStartFishSchool、Tick 和 UpdateGrid 阅读初始化与帧更新流程。
-- [FishSchoolStats.h](Source/UEFishSchool/Public/Stats/FishSchoolStats.h)：由 Manager 引用的统计结构。
-
-调用链、复杂度与已知问题见 [Architecture.md](docs/Architecture.md)；优化演进见 [OptimizationHistory.md](docs/OptimizationHistory.md)。早期逐鱼 Actor 原型不包含在本仓库中。
+[架构与调用链](docs/Architecture.md) · [优化过程](docs/OptimizationHistory.md) · [旧 ICO 版本](https://github.com/vorsell/UE-FishSchool/tree/56c2aecbec7aa50962dfdba5b4ccbbf9190a0a06)
 
 ## 历史性能记录
 
-开发阶段测试记录：**RTX 2060、i7-10875H、100000 条鱼，高压场景约 23 FPS → 33 FPS**。该数据对应当时完整场景的整体优化，包含行为精度、可见性及渲染提交策略调整；表现随视角、鱼群密度和资源配置变化。
+早期完整场景在 **RTX 2060、i7-10875H、100000 条鱼**的高压场景中记录到约 **23 FPS → 33 FPS**。这个结果来自当时行为精度、粗可见性与渲染提交策略的综合调整，包含可见鱼数量的变化。V2 是基于 ICO 的模块拆分，本仓库未给出 V2 的 FPS 对照数据。
 
-## 代码依赖
+## 依赖与许可
 
-实现依赖 Unreal Engine 的 Core、CoreUObject、Engine 和 Enhanced Input 接口。移植到完整 UE 工程时，需要配置模块与输入依赖、生成反射头文件，并接入玩家、摄像机及自有网格/材质资源。
+源码基于 UE 5.8，依赖 Core、CoreUObject、Engine 和 Enhanced Input。接入完整工程时，需要由 UE 生成反射头，并配置输入、场景和网格材质资源。
 
-## 许可
-
-源码采用 [PolyForm Noncommercial 1.0.0](LICENSE)，供非商用使用；商业使用需另行获得作者授权。Unreal Engine 及第三方资源遵循各自许可。
-
-作者：[Vorsel](https://github.com/vorsell)。
+作者 [Vorsel](https://github.com/vorsell)。源码采用 [PolyForm Noncommercial 1.0.0](LICENSE)，商业使用需另行获得作者授权。

@@ -1,79 +1,38 @@
 # 技术架构
 
-核心类为 AFishSchoolManagerICO：Manager 作为场景 Actor 管理整组鱼，鱼本身以数组索引表示。源码包括 [Manager 头文件](../Source/UEFishSchool/Public/FishSchool/FishSchoolManagerICO.h)、[Manager 实现](../Source/UEFishSchool/Private/FishSchool/FishSchoolManagerICO.cpp)和 [统计结构](../Source/UEFishSchool/Public/Stats/FishSchoolStats.h)。
+[AFishSchoolManagerV2](../Source/UEFishSchool/Public/FishSchool/SimulationV2/FishSchoolManagerV2.h) 是接入关卡与蓝图的 Actor。鱼由数组索引标识，由 `FishSchool::V2` 下的网格、可见性、行为和渲染模块统一处理。
 
-## 初始化与帧更新
+## 从初始化到渲染提交
 
-| 阶段 | 函数与实现文件行号 | 作用 |
+| 阶段 | 入口 | 作用 |
 | --- | --- | --- |
-| 输入绑定 | BeginPlay，41 | 在首个 PlayerController 的 Enhanced Input 组件上绑定启动及数据导出 Action |
-| 启动 | HandleStartFishSchool，2189 | 初始化数组；加载 CSV 或随机生成；建立网格、距离参数和渲染实例 |
-| 数据初始化 | InitFishSchool，111 | 分配双缓冲、鱼 ID 和 N×K 邻居缓存，缓存初值为 INDEX_NONE |
-| 帧入口 | Tick，74 | 更新玩家、距离档位和行为预计算，再执行仿真与渲染提交 |
-| 仿真入口 | TraversalGridFishGroup，281 | 交换缓冲、更新网格、并行计算行为并轮换 KNN 刷新组 |
-| 网格构建 | UpdateGrid，329 | Count → Prefix → Scatter → CPU 粗可见性分类 |
-| 邻域与行为 | GridFindKNearestNeighbour，894；UpdateFishKNN，469 | 查询局部 K 个近邻，计算目标、分离和一致性等行为 |
-| 单 ISM | InitRenderInstances，178；RenderAllInstances，201 | 初始化实例，每 Tick 批量提交全部鱼的变换 |
-| Chunk ISM | InitRenderChunks，948；RenderChunkedInstances，1091 | 构建 Chunk 鱼列表、更新状态并按策略提交变换 |
+| 初始化 | [Manager](../Source/UEFishSchool/Private/FishSchool/SimulationV2/FishSchoolManagerV2.cpp#L129) · `HandleStartFishSchool` | 以 Manager 初始位置为鱼群目标点，初始化网格和双缓冲，尝试用 CSV 恢复鱼群，失败时随机初始化，然后建立渲染实例 |
+| 帧级协调 | [Manager](../Source/UEFishSchool/Private/FishSchool/SimulationV2/FishSchoolManagerV2.cpp#L78) · `Tick` | 更新玩家位置和距离档位，准备绕流，交换缓冲后依次执行建网格、可见性分类、行为更新和渲染 |
+| 建网格 | [Grid](../Source/UEFishSchool/Private/FishSchool/SimulationV2/FishSchoolGrid.cpp#L62) · `FGrid::Build` | 每个任务统计自己那段鱼的 Cell 归属，经前缀和分配写入区间，再并行写入鱼 ID |
+| 可见性 | [Visibility](../Source/UEFishSchool/Private/FishSchool/SimulationV2/FishSchoolVisibility.cpp#L65) · `FVisibility::Update` | 并行更新密集格的私有深度桶，合并最近深度，再分类稀疏格并扩张高精度区域 |
+| 鱼群行为 | [Simulation](../Source/UEFishSchool/Private/FishSchool/SimulationV2/FishSchoolSimulation.cpp#L112) · `FSimulation::Step` | 并行处理排序后的鱼 ID，写入下一份状态缓冲 |
+| 玩家绕流 | [PlayerFlow](../Source/UEFishSchool/Private/FishSchool/SimulationV2/FishSchoolPlayerFlow.cpp#L179) · `FPlayerFlow::GetCorrection` | 在 Near 和 VeryNear 档位，只对影响通道内的候选鱼修正游动方向 |
+| 渲染 | [Renderer](../Source/UEFishSchool/Private/FishSchool/SimulationV2/FishSchoolRenderer.cpp#L71) · `FRenderer::Render` | 从本帧读取缓冲生成实例变换，通过单 ISM 或 Chunk ISM 提交 |
+| 数据与统计 | [CSV](../Source/UEFishSchool/Private/FishSchool/SimulationV2/FishSchoolCsv.cpp) · [统计结构](../Source/UEFishSchool/Public/Stats/FishSchoolStats.h) | 读写鱼群状态，导出网格和 Chunk 统计 |
 
-CSV 为可选初始状态。无对应文件时使用随机初始化，经过 warmup 后启用粗可见性分类。
+## 并行网格与局部 KNN
 
-行为分为三条路径：网格外及边缘鱼走目标点回归；内部格的 VisibleHigh 鱼走 KNN；其他内部格走 UpdateFishOrbitCross 简化环绕。深度关闭或本帧可见性数据无效时，内部格回退 KNN。所有行为路径均逐 Tick 执行。
+`SortedFishIds` 每条鱼占一个槽。计数阶段记录每条鱼的 `CellId`，并将计数写入任务自己的数组。前缀和确定 `CellStarts`，也为同一 Cell 内的各任务划出互不重叠的写入区间。Scatter 复用第一阶段的归属记录，各任务写入鱼 ID。网格外的鱼集中在末尾的桶中。设鱼数为 N、格数为 C、鱼遍历任务数为 T，建表主要工作量为 O(N + C×T)，任务私有计数与游标占用 O(C×T)。
 
-## 数据布局与双缓冲
+KNN 查询检查当前 Cell 及相邻共 27 格。遍历每格的鱼 ID，读取当前帧位置，按距离平方维护最近的 K 条鱼。候选数为 m 时，插入维护的单次查询开销上界为 O(m×K)。本轮未刷新的分组复用缓存的鱼 ID，用本帧状态重算邻居位置和朝向。
 
-FFishSchool 将位置、朝向、格 ID、实例 ID 和邻居缓存分开存储。位置和朝向分别是连续的 FVector3f 数组，并各有两份缓冲。
+各行为任务从同一份位置和朝向缓冲读取，只写自己负责的鱼在下一缓冲中的槽位。网格、可见性和渲染也读取本轮的输入状态，因此本轮算出的行为结果在下一 Tick 参与渲染。
 
-每帧行为从 PreviousBuffer 读取，向 NextBuffer 写入，避免单鱼更新顺序改变其他鱼读到的状态。渲染同样读取 PreviousBuffer，当前提交相对本轮行为输出滞后一 Tick。
+## 可见性和渲染
 
-FGrid 通过 CellStarts/CellCounts 描述连续 SortedFishIds 中每格的鱼区间。网格坐标使用 uint8 缓存；网格原点在初始化时由目标点计算，运行时不自动随 Manager 位移重建。
+CPU 深度桶存储投影后的 Cell 代表深度。密集格先写任务私有槽，合并时保留最近的 Cell 并降低落选格的状态，再用合并后的结果处理稀疏格。当深度判断关闭、仍在预热或拿不到相机投影时，网格内部鱼回退到 KNN。有效分类下，内部格的 `VisibleHigh` 鱼走 KNN，其余采用简化环绕。网格外及边缘鱼向目标点回归。
 
-## 并行网格构建
+单 ISM 每帧批量更新全部变换，以零缩放隐藏被筛除的实例。Chunk 路径每帧扫描鱼 ID 并按空间分块。可见块每帧提交，低频块按间隔或状态、鱼数变化提交，隐藏块清理旧槽。可见性无效时，网格外鱼显示在最近的边界块。
 
-1. UpdateFishInGrid（1462）：任务分别处理不重叠的鱼区间，写鱼的 CellId，并累加任务私有的格计数。
-2. 前缀和（1282 / 1326）：计算格起点及每个任务在格内的独占写入区间；并行版本采用正向、反向两个扫描分支。
-3. UpdateFishIds（1490）：使用任务私有游标，将鱼 ID Scatter 到预分配区间。
+单 ISM 写入逐鱼 VAT 时间偏移和播放速度。Chunk 复用根组件的静态网格，尚未同步根 ISM 的材质覆盖，也尚未写入逐实例 VAT 数据。VAT 动画和几何 LOD 由配套资源提供。
 
-各阶段等待 ParallelFor 完成后才进入下一阶段。行为任务通过排序后的不重叠鱼区间写 NextBuffer；KNN 临时距离数组按任务切片。密集格可见性阶段先写任务私有深度缓冲，再统一合并。
+## 已知边界
 
-设 N 为鱼数、C 为格数、T 为鱼遍历任务数、K 为邻居缓存数量，网格构建主要工作量为 O(N + C×T)，任务私有计数和游标占用 O(C×T) 空间。
-
-## 局部 KNN
-
-查询范围固定为自身及相邻共 27 格。遍历其中 m 个候选，排除自身并插入维护 K 个最近候选，单次查询约为 O(m×K)。分组轮换刷新减少每帧查询次数，其他帧复用缓存。
-
-该查询在局部范围内选择邻居，稀疏分布时可能找不满 K 个；集中分布时总查询仍可退化至 O(N²×K)。邻居缓存的刷新间隔则在计算成本和信息时效之间取舍。
-
-## CPU 粗可见性与行为分级
-
-流程为相机投影 → 密集格任务私有屏幕深度桶 → MergeDepthBuffer（1616） → 稀疏格分类 → DilateGrid（1651）邻格膨胀。
-
-深度桶记录网格代表深度，不读取 GPU 场景深度。合并阶段选择全局最近格，同时降低落选局部赢家的状态；邻格膨胀扩展高精度行为区域。bHasValidVisibilityData 每帧先清除，完成分类后才置真，行为和渲染共同以该标志决定是否消费本帧分类。
-
-距离自适应包含 VeryNear、Near、Mid、Far 四档，调整深度分辨率、密度阈值、膨胀、行为权重和 Chunk 提交参数。VeryNear 按玩家到鱼群目标点的距离判断，其他档位使用网格外接球距离。
-
-这些策略以网格粒度近似可见性，在行为精度、显示数量和计算开销之间取舍。
-
-## ISM、Chunk 与资源动画
-
-单 ISM 每帧构造并提交 N 个变换，裁剪项用零缩放隐藏。初始化写入两个自定义浮点值：随机动画时间偏移和统一播放速度；资源材质负责读取这些值。
-
-Chunk 默认按 5×5×5 划分为 125 个 ISM。BuildRenderChunkLists（1019）逐帧扫描全部鱼；Visible 块每帧提交，LowRender 块按间隔提交，状态或鱼数变化可触发提前提交，Hidden 块清理旧实例。容量只增不减，旧尾槽通过零缩放隐藏，因此分配槽数可能超过鱼数。
-
-Chunk 使用更多组件换取更细的空间提交粒度，收益取决于块分布、可见数量及提交频率。当前 Chunk 的 NumCustomDataFloats 为 0，尚未接入逐鱼随机 VAT 相位与播放速度数据。VAT 形变和模型 LOD 由网格、材质和纹理资源提供。
-
-## 已知问题
-
-| 问题 | 当前影响 | 改进方向 |
-| --- | --- | --- |
-| 参数校验不完善 | 部分可编辑参数缺少范围约束和初始化检查；错误的 K、任务幂次、网格/Chunk 尺寸或鱼原长配置可能导致除零或无效数组访问 | 补充编辑器约束，并在初始化时统一校验正数、幂次和尺寸关系 |
-| Chunk 未同步根 ISM 的材质覆盖 | 网格自带材质可正常使用，但根组件额外指定的 OverrideMaterials 未复制到 Chunk | 在 Chunk 初始化时同步材质覆盖 |
-| 统计字段未完整维护 | DenseCellCount 和 KNNCalcCount 当前未在 Tick 中填充，保留默认值 | 补齐统计更新，并明确鱼数、分配槽数及实际提交数的口径 |
-
-## 后续方向
-
-- 为低精度行为增加更新频率控制；当前仅 Chunk 渲染提交支持低频策略。
-- 利用激活格构建 Chunk 鱼列表，减少逐帧全量遍历。
-- 接入 Chunk 逐鱼 VAT 自定义数据，完善跨块迁移时的动画连续性。
-- 完善独立捕食者发现与管理；当前捕食者位置取自玩家。
-- 评估 GPU 仿真或 Mass/ECS 路线；当前实现为 CPU 仿真。
+- 网格原点在启动时根据目标点确定，运行时还没有随鱼群移动和旋转的网格。
+- Chunk 提交支持降频，仿真行为仍逐 Tick 更新。Chunk 鱼列表仍扫描全部鱼。
+- 统计结构中的 `DenseCellCount`、`KNNCalcCount` 尚未填充，`VisibleHighFishCount` 当前取自 Chunk 统计。
